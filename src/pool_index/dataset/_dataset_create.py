@@ -5,8 +5,14 @@ import shutil
 from pytube import YouTube
 import cv2
 
-from pool_index.util import FileT
+from pool_index.util import FileT, DebugT
 from pool_index.table import OpenCVTable
+
+BLUE_TABLE = [65, 173, 237]
+
+BLUE_TABLE_LOW = [192, 128,  20]
+BLUE_TABLE_HIGH = [282, 218, 110]
+
 
 def download_video(url: str, output_dir: str) -> str:
     """Download the video at the given URL.
@@ -32,24 +38,39 @@ def iterate_through_video(video: FileT, output_directory: FileT) -> None:
     balls = []
 
     capture = cv2.VideoCapture(video)
-    while 1:
-        _, image = capture.read()
 
-        table = OpenCVTable(image)
-        table.detect_balls(True)
+    # If capture is None, don't continue.
+    rollover = 0
+    if capture:
+        while 1:
+            _, image = capture.read()
 
-        # If some balls were detected save the image and record the balls
-        # locations.
-        if table.balls_up():
-            balls.append(table.balls_up())
+            if rollover == 10:
+                table = OpenCVTable(image)
+                table.detect_balls(DebugT.LEVEL_2, output_directory)
 
-            output_file = str(Path(output_directory, f"frame_{len(balls)}").with_suffix(".png"))
-            output_file_labeled = str(Path(output_directory, f"frame_{len(balls)}_traced").with_suffix(".png"))
-            shutil.move("images/gen/detected_objects_filtered.png", output_file_labeled)
-            cv2.imwrite(output_file, image)
+                dist = OpenCVTable._euclidian_distance(table.lower, BLUE_TABLE_LOW)
 
-    # Close the window
-    capture.release()
+                # If some balls were detected save the image and record the balls
+                # locations.
+                if table.balls_up() and len(table.balls_up()) <= 15 and dist < 50:
+                    balls.append(table.balls_up())
 
-    # De-allocate any associated memory usage
-    cv2.destroyAllWindows()
+                    output_file = str(Path(output_directory, f"frame_{len(balls)}").with_suffix(".png"))
+                    output_file_labeled = str(Path(output_directory, f"frame_{len(balls)}_traced").with_suffix(".png"))
+                    shutil.move(Path(output_directory, "detected_objects_filtered.png"), output_file_labeled)
+                    cv2.imwrite(output_file, image)
+
+                rollover = 0
+            else:
+                rollover += 1
+
+            # if sum([len(ball_list) for ball_list in balls]) > 40:
+            #     break
+
+
+        # Close the window
+        capture.release()
+
+        # De-allocate any associated memory usage
+        cv2.destroyAllWindows()

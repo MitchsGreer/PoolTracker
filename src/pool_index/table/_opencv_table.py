@@ -1,13 +1,16 @@
 """Table utilites."""
 import math
-from typing import List, Tuple, Union
+from typing import List, Tuple, Union, Optional
+from pathlib import Path
+from math import atan2, pi
 
+import matplotlib.pyplot as plt
 import cv2
 import numpy as np
 from numpy.typing import NDArray
 
 from pool_index.ball import PoolBall
-from pool_index.util import BallColors, FileT
+from pool_index.util import BallColors, FileT, DebugT
 
 
 class OpenCVTable:
@@ -68,9 +71,9 @@ class OpenCVTable:
             The high and low HSV values in the given image.
         """
         hsv = self.image.copy()
-        hsv = cv2.cvtColor(hsv, cv2.COLOR_RGB2HSV)
+        # hsv = cv2.cvtColor(hsv, cv2.COLOR_RGB2HSV)
 
-        hist = cv2.calcHist([hsv], [1], None, [180], [0, 180])
+        hist = cv2.calcHist([hsv], [0], None, [256], [0, 256])
         h_max = self._get_index_of_max(hist)[0]
 
         hist = cv2.calcHist([hsv], [1], None, [256], [0, 256])
@@ -150,7 +153,7 @@ class OpenCVTable:
         for i in range(len(ctrs)):
             rot_rect = cv2.minAreaRect(ctrs[i])
             box = np.int64(cv2.boxPoints(rot_rect))
-            cv2.drawContours(output, [box], 0, (255, 100, 0), 2)
+            cv2.drawContours(output, [box], 0, (0, 0, 0), 2)
 
         return output
 
@@ -216,7 +219,7 @@ class OpenCVTable:
         """
 
         distances = [
-            OpenCVTable._euclidian_disance(rgb, BallColors[color].value)
+            OpenCVTable._euclidian_distance(rgb, BallColors[color].value)
             for color in BallColors._member_names_
         ]
         min_distance = min(distances)
@@ -225,7 +228,108 @@ class OpenCVTable:
         return BallColors[BallColors._member_names_[min_index]].name
 
     @staticmethod
-    def _euclidian_disance(
+    def find_close_contours(ctrs: List[NDArray], distance_tresh: float) -> List[NDArray]:
+        """Find contrours that are within some distance threshold.
+
+        Args:
+            ctrs: THe contours to find close ones for.
+            distance_tresh: The distance threshold for 'close'.
+
+        Returns:
+            A list of close thresholds.
+        """
+        close_contours = []
+        checked = set()
+        for i, contour in enumerate(ctrs):
+            bbox = cv2.boundingRect(contour)
+
+            for j, c_contour in enumerate(ctrs):
+                c_bbox = cv2.boundingRect(c_contour)
+
+                # Don't compare with ourself.
+                if bbox == c_bbox:
+                    continue
+
+                x = bbox[0]
+                y = bbox[1]
+
+                c_x = c_bbox[0]
+                c_y = c_bbox[1]
+
+                if OpenCVTable._euclidian_distance([x, y, 0], [c_x, c_y, 0]) < distance_tresh:
+                    checked_indicies = tuple(sorted([i, j]))
+
+                    if checked_indicies not in checked:
+                        close_contours.append((checked_indicies, (contour, c_contour)))
+                        checked.add(checked_indicies)
+
+        return close_contours
+
+    @staticmethod
+    def _merge_contours(ctrs: List[NDArray]) -> NDArray:
+        """Merge the given contours into one contour.
+
+        Lifted from: https://stackoverflow.com/questions/44501723/how-to-merge-contours-in-opencv
+
+        Args:
+            ctrs: The contours to merge.
+
+        Returns:
+            The merged countour.
+        """
+        # Get all the points into the same place.
+        list_of_pts = []
+        for ctr in ctrs:
+            list_of_pts += [pt[0] for pt in ctr]
+
+        # Sort the points in some kind of order.
+        center_pt = np.array(list_of_pts).mean(axis = 0) # get origin
+        clock_ang_dist = clockwise_angle_and_distance(center_pt) # set origin
+        list_of_pts = sorted(list_of_pts, key=clock_ang_dist) # use to sort
+
+        # Force the list into cv2 format.
+        ctr = np.array(list_of_pts).reshape((-1,1,2)).astype(np.int32)
+
+        # Make a shape out of the points.
+        return cv2.convexHull(ctr)
+
+    @staticmethod
+    def _merge_close_contours(ctrs: List[NDArray], distance_tresh: float) -> List[NDArray]:
+        """Merge close contours.
+
+        Args:
+            ctrs: The contours to merge.
+            distance_tresh: The distance threshold for 'close'.
+
+        Returns:
+            The merged contour list.
+        """
+        contours = OpenCVTable.find_close_contours(ctrs, distance_tresh)
+        if contours:
+            merged_contours = []
+            for contour in contours:
+                merged_contours.append(OpenCVTable._merge_contours(contour[1]))
+
+            indexes_to_removed = set()
+            for contour in contours:
+                indexs = contour[0]
+                indexes_to_removed.add(indexs[0])
+                indexes_to_removed.add(indexs[1])
+            indexes_to_removed = list(indexes_to_removed)
+
+            ctrs = list(ctrs)
+            for index in indexes_to_removed:
+                ctrs.pop(index)
+
+                for i in range(len(indexes_to_removed)):
+                    indexes_to_removed[i] -= 1
+
+            ctrs = list(ctrs) + merged_contours
+
+        return ctrs
+
+    @staticmethod
+    def _euclidian_distance(
         point_1: Tuple[int, int, int], point_2: Tuple[int, int, int]
     ) -> float:
         """Distance between two points in three-dimensional space.
@@ -245,13 +349,16 @@ class OpenCVTable:
             + (point_1[2] - point_2[2]) ** 2
         )
 
-    def detect_balls(self, debug: bool = False) -> None:
+    def detect_balls(self, debug: bool = DebugT, debug_folder: Optional[FileT] = None) -> None:
         """Detect pool balls on this table.
 
         TODO: Add a debug folder to save images to.
         TODO: Add debugging levels to allow for just the filtered objects to be
               saved.
 
+        Args:
+            debug: Level of debug for this method.
+            debug_folder: The folder to save debug images to.
         """
         transformed = self.image.copy()
 
@@ -260,8 +367,11 @@ class OpenCVTable:
 
         # hsv colors of the snooker table
         hsv = cv2.cvtColor(blur_RGB, cv2.COLOR_RGB2HSV)  # convert to hsv
-        lower, upper = self._felt_color()
-        mask = cv2.inRange(hsv, lower, upper)  # table's mask
+        if debug == DebugT.LEVEL_2:
+            cv2.imwrite(str(Path(debug_folder, "hsv.png")), hsv)
+
+        self.lower, self.upper = self._felt_color()
+        mask = cv2.inRange(transformed, self.lower, self.upper)  # table's mask
 
         # apply closing
         kernel = np.ones((5, 5), np.uint8)
@@ -270,45 +380,48 @@ class OpenCVTable:
         # Invert mask to focus on objects on table.
         _, mask_inv = cv2.threshold(mask_closing, 5, 255, cv2.THRESH_BINARY_INV)
 
-        if debug:
+        if debug == DebugT.LEVEL_2:
             # masked image with inverted mask
             masked_img = cv2.bitwise_and(transformed, transformed, mask=mask_inv)
 
-            cv2.imwrite("images/gen/transformed_blur.png", transformed_blur)
-            cv2.imwrite("images/gen/mask_closing.png", mask_closing)
-            cv2.imwrite("images/gen/masked_img.png", masked_img)
+            cv2.imwrite(str(Path(debug_folder, "transformed_blur.png")), transformed_blur)
+            cv2.imwrite(str(Path(debug_folder, "mask_closing.png")), mask_closing)
+            cv2.imwrite(str(Path(debug_folder, "masked_img.png")), masked_img)
 
         # Find contours and filter them.
-        ctrs, hierarchy = cv2.findContours(
+        ctrs, _ = cv2.findContours(
             mask_inv, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE
         )
 
-        if debug:
+        # Merge contours so we can get balls cut in half.
+        ctrs = self._merge_close_contours(ctrs, 10)
+
+        if debug == DebugT.LEVEL_2:
             detected_objects = self._draw_rectangles(ctrs, transformed)
-            cv2.imwrite("images/gen/detected_objects.png", detected_objects)
+            cv2.imwrite(str(Path(debug_folder, "detected_objects.png")), detected_objects)
 
         ctrs_filtered = self._filter_ctrs(
             ctrs
         )  # filter unwanted contours (wrong size or shape)
 
-        if debug:
+        if debug == DebugT.LEVEL_2:
             # draw contours after filter
             detected_objects_filtered = self._draw_rectangles(
                 ctrs_filtered, transformed
             )  # filtered detected objects will be marked in boxes
 
             cv2.imwrite(
-                "images/gen/detected_objects_filtered.png", detected_objects_filtered
+                str(Path(debug_folder, "detected_objects_filtered.png")), detected_objects_filtered
             )
 
         # find average color inside contours:
         ctrs_color, colors = self._find_ctrs_color(ctrs_filtered, transformed)
 
-        if debug:
+        if debug == DebugT.LEVEL_2:
             # contours color image + transformed image
             ctrs_color = cv2.addWeighted(ctrs_color, 0.5, transformed, 0.5, 0)
 
-            cv2.imwrite("images/gen/ctrs_color.png", ctrs_color)
+            cv2.imwrite(str(Path(debug_folder, "ctrs_color.png")), ctrs_color)
 
         for ball, color in zip(ctrs_filtered, colors):
             bbox = cv2.boundingRect(ball)
@@ -339,3 +452,54 @@ class OpenCVTable:
             balls_up.append(ball_map[ball.number])
 
         return balls_up
+
+class clockwise_angle_and_distance():
+    '''
+    A class to tell if point is clockwise from origin or not.
+    This helps if one wants to use sorted() on a list of points.
+
+    Parameters
+    ----------
+    point : ndarray or list, like [x, y]. The point "to where" we g0
+    self.origin : ndarray or list, like [x, y]. The center around which we go
+    refvec : ndarray or list, like [x, y]. The direction of reference
+
+    use:
+        instantiate with an origin, then call the instance during sort
+    reference:
+    https://stackoverflow.com/questions/41855695/sorting-list-of-two-dimensional-coordinates-by-clockwise-angle-using-python
+
+    Returns
+    -------
+    angle
+
+    distance
+
+
+    '''
+    def __init__(self, origin):
+        self.origin = origin
+
+    def __call__(self, point, refvec = [0, 1]):
+        if self.origin is None:
+            raise NameError("clockwise sorting needs an origin. Please set origin.")
+        # Vector between point and the origin: v = p - o
+        vector = [point[0]-self.origin[0], point[1]-self.origin[1]]
+        # Length of vector: ||v||
+        lenvector = np.linalg.norm(vector[0] - vector[1])
+        # If length is zero there is no angle
+        if lenvector == 0:
+            return -pi, 0
+        # Normalize vector: v/||v||
+        normalized = [vector[0]/lenvector, vector[1]/lenvector]
+        dotprod  = normalized[0]*refvec[0] + normalized[1]*refvec[1] # x1*x2 + y1*y2
+        diffprod = refvec[1]*normalized[0] - refvec[0]*normalized[1] # x1*y2 - y1*x2
+        angle = atan2(diffprod, dotprod)
+        # Negative angles represent counter-clockwise angles so we need to
+        # subtract them from 2*pi (360 degrees)
+        if angle < 0:
+            return 2*pi+angle, lenvector
+        # I return first the angle because that's the primary sorting criterium
+        # but if two vectors have the same angle then the shorter distance
+        # should come first.
+        return angle, lenvector
